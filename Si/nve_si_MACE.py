@@ -12,16 +12,16 @@ from jax import jit, grad, random, lax, config as jax_config_mod
 
 jax_config_mod.update("jax_enable_x64", True)
 
-from jax_md import simulate, quantity, dataclasses, units
+from jax_md import simulate, quantity, dataclasses, units, space, partition
 
 from mace.calculators import foundations_models
 from mace.tools.scripts_utils import extract_config_mace_model
-from jax_md._nn.mace_jax_interface.mace_jax_from_torch import convert_model
-from jax_md._nn.mace_jax_interface.mace_jaxmd_bridge import make_mace_jaxmd_energy
-from jax_md._nn.mace_jax_interface.stress_utils import make_pressure_snapshot_fn
+from jax_md._nn.mace.mace_jax_from_torch import convert_model
+from jax_md._nn.mace.featurizer import mace_featurizer
 from mace_jax.tools.device import configure_torch_runtime, get_torch_device
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -50,23 +50,6 @@ def load_foundation_model(source="mp", variant=None, device="cpu"):
     return model.float().eval()
 
 
-def make_energy_fn_compatible(energy_fn_raw):
-    @jit
-    def energy_fn(R, box=None, neighbor=None, neighbors=None, neighbor_idx=None, **kwargs):
-        del kwargs
-        if neighbor_idx is None:
-            if neighbors is None:
-                neighbors = neighbor
-            if neighbors is None:
-                raise ValueError(
-                    "Provide either neighbor=..., neighbors=..., or neighbor_idx=..."
-                )
-            neighbor_idx = neighbors.idx
-        return energy_fn_raw(R, box=box, neighbor_idx=neighbor_idx)
-
-    return energy_fn
-
-
 def read_lammps_dump_timestep(filename, target_timestep=0):
     with open(filename, "r") as f:
         lines = f.readlines()
@@ -91,20 +74,13 @@ def read_lammps_dump_timestep(filename, target_timestep=0):
         if timestep == target_timestep:
             rows = [line.split() for line in lines[data_start:data_end]]
             data = onp.array(rows, dtype=float)
-
             col = {name: idx for idx, name in enumerate(columns)}
 
             ids = data[:, col["id"]].astype(int)
             types = data[:, col["type"]].astype(int)
-            pos = onp.stack(
-                [data[:, col["x"]], data[:, col["y"]], data[:, col["z"]]], axis=1
-            )
-            vel = onp.stack(
-                [data[:, col["vx"]], data[:, col["vy"]], data[:, col["vz"]]], axis=1
-            )
-            force = onp.stack(
-                [data[:, col["fx"]], data[:, col["fy"]], data[:, col["fz"]]], axis=1
-            )
+            pos = onp.stack([data[:, col["x"]], data[:, col["y"]], data[:, col["z"]]], axis=1)
+            vel = onp.stack([data[:, col["vx"]], data[:, col["vy"]], data[:, col["vz"]]], axis=1)
+            force = onp.stack([data[:, col["fx"]], data[:, col["fy"]], data[:, col["fz"]]], axis=1)
 
             order = onp.argsort(ids)
             return {
@@ -118,6 +94,7 @@ def read_lammps_dump_timestep(filename, target_timestep=0):
         i = data_end
 
     raise ValueError(f"Timestep {target_timestep} not found in {filename}")
+
 
 def main():
     output_dir = Path("output_nve_si_mace")
@@ -135,12 +112,12 @@ def main():
     foundation_source = "mp"
     foundation_variant = "small-0b2"
     k_neighbors = 96
-    min_n_template = 89 
     dr_threshold = 0.5
     capacity_multiplier = 6.0
 
     box_np = onp.array([21.724, 21.724, 21.724], dtype=onp.float32)
     box = jnp.array(box_np, dtype=DTYPE)
+    box_matrix = jnp.diag(box)
 
     timestep_ps = 1e-3
 
@@ -197,14 +174,9 @@ def main():
 
     torch_model = torch_model.to(torch_device)
 
-    n_template = max(min_n_template, N_real)
-    e_template = n_template * k_neighbors
-
-    graphdef, nnx_state, template_batch, jax_model_config = convert_model(
+    graphdef, nnx_state, jax_model_config = convert_model(
         torch_model,
         torch_model_config,
-        n_template=n_template,
-        e_template=e_template,
     )
     jax_model = nnx.merge(graphdef, nnx_state)
 
@@ -215,33 +187,79 @@ def main():
     key = random.PRNGKey(121)
 
     nsave = nsteps_sim // write_every
-
     r_cutoff = float(jax_model_config["r_max"])
 
-    (
-        neighbor_fn,
-        shift_fn,
-        energy_fn_raw,
-        freeze_graph_fn,
-        make_fixed_graph_energy_fn,
-    ) = make_mace_jaxmd_energy(
-        jax_model=jax_model,
-        template_batch=template_batch,
-        config=jax_model_config,
-        box=box,
-        z_atomic=z_real,
-        r_cutoff=r_cutoff,
+    displacement_fn, shift_fn = space.periodic_general(
+        box_matrix,
+        fractional_coordinates=False,
+    )
+
+    neighbor_fn = partition.neighbor_list(
+        displacement_fn,
+        box,
+        r_cutoff,
         dr_threshold=dr_threshold,
-        k_neighbors=k_neighbors,
         capacity_multiplier=capacity_multiplier,
-        include_head=True,
+        format=partition.Dense,
     )
-    energy_fn = make_energy_fn_compatible(energy_fn_raw)
-    pressure_snapshot_fn = make_pressure_snapshot_fn(
-     freeze_graph_fn=freeze_graph_fn,
-     make_fixed_graph_energy_fn=make_fixed_graph_energy_fn,
-     mass=mass,
+
+    featurize = mace_featurizer(
+        displacement_fn,
+        jax_model_config,
+        z_real,
+        fractional_coordinates=False,
     )
+
+    def _energy_from_batch(batch):
+        out = jax_model(batch, compute_stress=False)
+        if isinstance(out, dict):
+            if "energy" in out:
+                return jnp.sum(out["energy"])
+            if "energies" in out:
+                return jnp.sum(out["energies"])
+            raise KeyError(f"Could not find energy key in model output: {out.keys()}")
+        return jnp.sum(out)
+
+    @jit
+    def energy_fn(R, box=None, neighbor=None, neighbors=None, **kwargs):
+        del kwargs
+        if neighbor is None:
+            neighbor = neighbors
+        if neighbor is None:
+            raise ValueError("Provide neighbor=... or neighbors=...")
+
+        if box is None:
+            box_ = box_matrix
+        else:
+            box_ = jnp.asarray(box)
+            if box_.shape == (3,):
+                box_ = jnp.diag(box_)
+
+        batch = featurize(R, neighbor, box=box_)
+        return _energy_from_batch(batch)
+
+    @jit
+    def pressure_snapshot_fn(state, box, neighbor):
+        box_vec = jnp.asarray(box, dtype=DTYPE)
+        box_mat = jnp.diag(box_vec) if box_vec.shape == (3,) else box_vec
+        volume = jnp.linalg.det(box_mat)
+
+        kinetic = quantity.kinetic_energy(momentum=state.momentum, mass=mass)
+
+        def scaled_energy(eps):
+            perturbation = jnp.eye(3, dtype=DTYPE) * (1.0 + eps)
+            batch = featurize(
+                state.position,
+                neighbor,
+                box=box_mat,
+                perturbation=perturbation,
+            )
+            return _energy_from_batch(batch)
+
+        dU_deps = grad(scaled_energy)(jnp.asarray(0.0, dtype=DTYPE))
+        pressure = (2.0 * kinetic - dU_deps) / (3.0 * volume)
+        return pressure
+
     frame0 = read_lammps_dump_timestep(dump_file, target_timestep=0)
 
     pos_dump = frame0["pos"].astype(onp.float32)
@@ -263,7 +281,9 @@ def main():
     E0 = energy_fn(positions_dump, box=box, neighbor=nbrs_dump)
     print(f"Initial energy on dump timestep 0: {float(E0):.8f} eV")
 
-    force_fn = jit(lambda R, nbrs_: -grad(lambda X: energy_fn(X, box=box, neighbor=nbrs_))(R))
+    force_fn = jit(
+        lambda R, nbrs_: -grad(lambda X: energy_fn(X, box=box, neighbor=nbrs_))(R)
+    )
     F0 = force_fn(positions_dump, nbrs_dump)
 
     F_jax = onp.array(F0, dtype=onp.float64)
@@ -287,11 +307,16 @@ def main():
 
     state0 = dataclasses.replace(
         simulate.nve(energy_fn, shift_fn, dt=dt)[0](
-            key, positions_dump, box=box, neighbor=nbrs_dump, kT=T_init, mass=mass
+            key,
+            positions_dump,
+            box=box,
+            neighbor=nbrs_dump,
+            kT=T_init,
+            mass=mass,
         ),
         momentum=mass * velocity_dump * unit["velocity"],
     )
-    
+
     P0 = pressure_snapshot_fn(state0, box, nbrs_dump)
 
     print("JAX pressure at dump timestep 0 (bar):", float(P0 / unit["pressure"]))
@@ -341,9 +366,10 @@ def main():
 
     @jit
     def step_fn(i, state_nbrs):
+        del i
         state_, nbrs_ = state_nbrs
         state_ = apply_fn(state_, neighbor=nbrs_)
-        nbrs_ = nbrs_.update(state_.position, neighbor=nbrs_)
+        nbrs_ = nbrs_.update(state_.position)
         return state_, nbrs_
 
     pressure_every_blocks = 10
@@ -373,7 +399,6 @@ def main():
             E = energy_fn(state.position, box=box, neighbor=nbrs)
             Temp = quantity.temperature(momentum=state.momentum, mass=mass)
             Etot = K + E
-
             P = pressure_snapshot_fn(state, box, nbrs)
 
             log["E_pot"] = log["E_pot"].at[ilog].set(E)
