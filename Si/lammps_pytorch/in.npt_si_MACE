@@ -1,0 +1,31 @@
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+read_data       si_init.data
+
+pair_style      mliap unified /home/drosenbe/mace_models/mace-small-density-agnesi-stress.model-mliap_lammps.pt 0
+pair_coeff      * * Si
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes
+
+timestep        0.001
+fix             1 all npt temp 300.0 300.0 $(100.0*dt) iso 3000.0 3000.0 $(1000.0*dt)
+
+thermo          100
+thermo_style    custom step temp press pe ke etotal vol
+
+variable myTemp equal temp
+variable myPress equal press
+variable myPE equal pe
+variable myKE equal ke
+variable myET equal etotal
+
+fix thermo_out all ave/time 1000 1 1000 v_myTemp v_myPress v_myPE v_myKE v_myET file thermo_mace.dat mode scalar
+
+dump            1 all custom 1000 dump.nve id type x y z vx vy vz fx fy fz
+dump_modify     1 sort id
+
+run             10000
